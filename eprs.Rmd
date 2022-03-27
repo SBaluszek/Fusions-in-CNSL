@@ -1,0 +1,926 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+rm(list=ls())
+wd = getwd()
+```
+
+```{r}
+library(ggplot2)
+library(limma)
+library(biomaRt)
+library(ComplexHeatmap)
+library(multtest)
+library(TCGAutils)
+library(circlize)
+library(Rtsne)
+library(clValid)
+library(edgeR)
+library(circlize)
+library(xlsx)
+```
+
+```{r}
+substrRight <- function(x, n, m=0){
+  substr(x, nchar(x)-n+1, nchar(x)-m+1)
+}
+
+flip <- function(x){
+  x = as.matrix(x)
+  y = t(apply(x, 2, rev))
+  rownames(y)=colnames(x)
+  colnames(y)=rev(rownames(x))
+  return (y)
+}
+
+hch = function(H, range = 2:5){
+  t=matrix(0,nrow = 0,ncol=6)
+  for(X in c("euclidean", "maximum", "manhattan", "canberra", "binary", "minkowski")){
+    for(x in c("ward.D", "ward.D2", "single", "complete", "average", "mcquitty", "median", "centroid" )){
+      for(el in 2:5){
+        d=dist(H, method = X)
+        h=hclust(d, method = x)
+        ct=cutree(h,k=el)
+        if((sum(ct==1)<20)&(!is.na(dunn(d,ct)))){
+          t=rbind(t, matrix(nrow=1, c(X,x,el,connectivity(d,ct),dunn(d,ct),mean(silhouette(x=ct, dist=d)[,3]))))
+        }
+      }
+    }
+  }
+  colnames(t)=c("distance","method","nclust","connectivity","Dunn","sillhouette")
+  t=as.data.frame(t)
+  t$connectivity=as.numeric(as.character(t$connectivity))
+  t$Dunn=as.numeric(as.character(t$Dunn))
+  t$sillhouette=as.numeric(as.character(t$sillhouette))
+  t$score = (t$sillhouette-min(t$sillhouette))/(max(t$sillhouette)-min(t$sillhouette))+(t$Dunn-min(t$Dunn))/(max(t$Dunn)-min(t$Dunn))-(t$connectivity-min(t$connectivity))/(max(t$connectivity)-min(t$connectivity))
+  t=t[order(t$score,decreasing = T),]
+  return(t)
+}
+```
+
+
+
+
+```{r}
+setwd(paste0(wd, "/dt/reads"))
+t=1:(length(list.files()))
+names(t)=list.files()
+for(el in list.files()){
+  x = read.table(el, header = T)
+  X = colnames(x)
+  X = gsub("X.mnt.qnap.sam.STAR_Fusion_on_PCNSL_RNA_seq_data.12092018_star_fusion_pipeline_workdir_","",X)
+  X = gsub(".std.STAR.bam","",X)
+  colnames(x)=X
+  rownames(x)=x$Geneid
+  X=x[,1:6]
+  x=x[,-(1:6)]
+  assign(paste(substrRight(el,9,5), "reads", sep="_"), x)
+  assign(paste(substrRight(el,9,5), "meta", sep="_"), X)
+  y=cpm(x)
+  print(dim(y))
+  keep=rowSums(y > 0.5) >= 2
+  y=x[keep,]
+  y=cpm(y)
+  print(dim(y))
+  assign(paste(substrRight(el,9,5), "cpm", sep="_"), y)
+  y=rpkm(x[keep,],X[keep,]$Length)
+  assign(paste(substrRight(el,9,5), "rpkm", sep="_"), y)
+  y <- DGEList(x)
+  barplot(y$samples$lib.size,names=colnames(y),las=2)
+  title(paste(el, "library sizes"))
+  
+  boxplot(y$counts, xlab=colnames(y$counts), ylab="Counts",las=2)
+  abline(h=median(y$counts),col="blue")
+  title(paste(el, "Counts (unnormalised)"))
+  
+  logcounts <- cpm(y,log=TRUE)
+  boxplot(logcounts, xlab=colnames(X), ylab="Log2 counts per million",las=2)
+  abline(h=median(logcounts),col="blue")
+  title(paste(el, "logCPMs (unnormalised)"))
+}
+```
+
+```{r}
+dim(cpm(x))
+```
+
+
+```{r}
+x=matrix(rnorm(30,10,10), ncol = 3)
+colnames(x) = paste("C", 1:3, sep = "")
+rownames(x) = paste("G", 1:10, sep="")
+X=matrix(rnorm(30,100,10), ncol = 3)
+colnames(X) = paste("C", 4:6, sep = "")
+rownames(X) = paste("G", 1:10, sep="")
+x=cbind(x,X)
+Heatmap(x)
+x=normalizeQuantiles(x)
+Heatmap(x)
+```
+
+
+
+```{r}
+
+mart <- useMart("ENSEMBL_MART_ENSEMBL", host = "uswest.ensembl.org")
+ensembl = useDataset("hsapiens_gene_ensembl",mart=mart)
+trl = getBM(attributes=c("ensembl_gene_id","hgnc_symbol", "entrezgene", "start_position", "end_position", "chromosome_name", "strand"), mart= ensembl)
+trl$chromosome_name[nchar(trl$chromosome_name)>3] = gsub("_", "", substr(trl$chromosome_name[nchar(trl$chromosome_name)>3], 10, 11))
+```
+
+```{r}
+exprs = case1_rpkm
+exprs = normalizeQuantiles(exprs)
+
+exprs = exprs[order(rowSums(exprs), decreasing = T),]
+x=trl$hgnc_symbol[match(rownames(exprs), trl$entrezgene)]
+exprs = exprs[!is.na(x),]
+x=x[!is.na(x)]
+exprs = exprs[!duplicated(x),]
+x=x[!duplicated(x)]
+rownames(exprs)=x
+setwd(paste0(wd))
+write.table(as.data.frame(exprs),sep = "\t",file="cnsl_exprs.txt")
+```
+
+```{r}
+setwd(paste0(wd, "/dt"))
+lm=read.table("LM22.txt",sep = "\t", header = T)
+```
+
+```{r}
+ecbs = case1_rpkm
+
+ecbs = ecbs[order(rowSums(ecbs), decreasing = T),]
+x=trl$hgnc_symbol[match(rownames(ecbs), trl$entrezgene)]
+ecbs = ecbs[!is.na(x),]
+x=x[!is.na(x)]
+ecbs = ecbs[!duplicated(x),]
+x=x[!duplicated(x)]
+rownames(ecbs)=x
+ecbs=ecbs[match(lm$Gene.symbol, rownames(ecbs)),]
+ecbs=ecbs[!is.na(rownames(ecbs)),]
+setwd(wd)
+write.table(as.data.frame(ecbs),sep = "\t",file="cnsl_ecbs.txt")
+```
+
+
+
+```{r}
+setwd(paste0(wd, "/dt/fusion"))
+
+fusions = read.csv("fusions_in_PCNSL_data_results_FULL.csv", header = T)
+fusions = fusions[,!colnames(fusions)=="X"]
+```
+
+```{r}
+ft=matrix(0,ncol=dim(exprs)[2],nrow=length(unique(fusions$X.FusionName)))
+colnames(ft)=colnames(exprs)
+rownames(ft)=unique(fusions$X.FusionName)
+
+for(el in 1:(dim(fusions)[1])){
+  ft[as.character(fusions[el,"X.FusionName"]),as.character(fusions[el,"sample_name"])]=1
+}
+
+fl = colSums(ft)
+
+
+ft=ft[rowSums(ft)<30,]
+ft=ft[rowSums(ft)>1,]
+ft=flip(ft)
+ft=as.data.frame(ft)
+ft$`Fusion load`=fl[rownames(ft)]
+as.data.frame(ft)
+```
+
+
+
+
+
+```{r}
+setwd(paste0(wd, "/dt/xcell"))
+#x=read.csv("xCell_cnsl_exprs_xCell_1454111418.csv")
+x = read.csv("xCell_cnsl_exprs_xCell_RAW.csv", header = T,)
+rownames(x)=x$X
+x = x[,!colnames(x)=="X"]
+
+x=as.data.frame(flip(x))
+
+sel = c("Adipocytes", "Chondrocytes", "CLP", "CMP", "Endothelial cells", "Epithelial cells", "Fibroblasts","Hepatocytes", "Keratinocytes", "ly Endothelial cells", "Megakaryocytes", "Myocytes", "Melanocytes","MEP","Mesangial cells", "MPP","MSC","MPP","MSC", "Preadipocytes","pro B-cells","Skeletal muscle", "Smooth muscle", "Sebocytes", "Platelets", "Osteoblast", "GMP", "HSC","mv Endothelial cells" )
+x$Other = rowSums(x[,sel])
+for(el in sel){
+  x = x[,!colnames(x)==el]
+}
+
+f=function(x){
+  '
+  x[x==-Inf]=min(x[!x==-Inf])-1
+  x=x-median(x)
+  x=x/sd(x)
+  '
+  x = x/sum(x)
+}
+
+x = apply(x,1,f)
+xcell=as.data.frame(x)
+xcell
+```
+
+
+
+
+
+```{r}
+setwd(paste0(wd, "/dt"))
+#x=read.csv("xCell_cnsl_exprs_xCell_1454111418.csv")
+x = read.csv("CIBERSORT.csv", header = T)
+rownames(x)=x$Input.Sample
+for(el in c("Input.Sample","P.value","Pearson.Correlation","RMSE")){
+  x = x[,!colnames(x)==el]
+}
+xsort = as.data.frame(flip(x))
+```
+
+```{r}
+wilcoxon = function(M,resp){
+  X = data.frame(names=rownames(M),p=1,Z=0)
+  rownames(X)=X$names
+  for(el in rownames(M)){
+    df = data.frame(pop = as.matrix(M)[el,],
+                    fus = ifelse(resp==1,"yes","no"))
+    x = wilcox.test(pop ~ fus, data = df, conf.int=T)
+    X[el,"p"] = x$p.value
+    X[el,"Z"] = x$estimate
+  }
+  X$padj = p.adjust(X$p, method = "BH")
+  return(X[order(X$p),!colnames(X)=="names"])
+}
+```
+
+
+
+```{r}
+setwd(paste0(wd, "/res"))
+for(el in c("MTATP8P2--MTATP6P1","MTND2P28--MTND2P5","C1QC--CACNB3")){
+  x = wilcoxon(xcell,ft[colnames(xcell),el])
+  assign(paste(gsub("--", "_", el), "WT", "xcell", sep="_"), x)
+  x = x[x$padj<0.01,]
+  write.csv(x, file = paste(gsub("--", "_", el), "_WT", "_xCell", ".csv", sep=""))
+}
+```
+
+```{r}
+setwd(paste0(wd, "/res"))
+for(el in c("MTATP8P2--MTATP6P1","MTND2P28--MTND2P5","C1QC--CACNB3")){
+  x = wilcoxon(xsort,ft[colnames(xsort),el])
+  assign(paste(gsub("--", "_", el), "WT", "xsort", sep="_"), x)
+  x = x[x$p<0.01,]
+  write.csv(x, file = paste(gsub("--", "_", el), "_WT", "_cibersort", ".csv", sep=""))
+}
+```
+
+```{r}
+C1QC_CACNB3_WT_xcell
+MTATP8P2_MTATP6P1_WT_xcell
+MTND2P28_MTND2P5_WT_xcell
+```
+
+```{r}
+C1QC_CACNB3_WT_xsort
+MTATP8P2_MTATP6P1_WT_xsort
+MTND2P28_MTND2P5_WT_xsort
+```
+
+
+
+```{r}
+wilcox.test(x=ft$`C1QC--CACNB3`, y=as.matrix(xcell)["pDC",rownames(ft)], conf.int = T)
+```
+
+```{r}
+
+```
+
+```{r}
+xcell
+```
+
+
+
+```{r}
+group = ifelse(ft[colnames(case1_reads),"C1QC--CACNB3"]==1,"yes","no")
+y <- DGEList(counts=case1_reads, group=group)
+keep <- rowSums(cpm(y)>1) >= 3
+y <- y[keep, , keep.lib.sizes=FALSE]
+y <- calcNormFactors(y)
+y <- estimateDisp(y)
+```
+```{r}
+et <- exactTest(y)
+x=decideTestsDGE(et)
+summary(x)
+x = x@.Data
+```
+```{r}
+names(x[x==1,])
+```
+
+```{r}
+trl[match(names(x[x==1,]),trl$entrezgene),]
+```
+
+```{r}
+Q = et$table$logFC
+names(Q) = rownames(et$table)
+length(Q)
+Q = Q[order(abs(Q),decreasing = T)]
+Q = Q[!duplicated(Q)]
+length(Q)
+```
+
+```{r}
+library(fgsea)
+library(BiocParallel)
+library(limma)
+setwd(paste0(wd, "/dt"))
+load("human_c5_v5p2.rdata")
+
+names(Hs.c5)=gsub("_", " ", names(Hs.c5))
+names(Hs.c5)=gsub("GO ", "", names(Hs.c5))
+fgseaRes <- fgsea(pathways = Hs.c5, 
+                  stats = Q,
+                  minSize=5,
+                  maxSize=10000,
+                  nperm=100000)
+idx <- ids2indices(Hs.c5,id=names(Q))
+
+go = as.data.frame(fgseaRes)
+go = go[go$padj<0.01,]
+go = go[order(abs(go$NES),decreasing = T),]
+x=go[1:20,]
+x=x[order(x$NES,decreasing = T),]
+x=as.character(x$pathway)
+
+setwd(paste0(wd, "/res"))
+png(file="GO.png",width=300,height=(10+10*length(x)),res=400,units = "mm")
+
+plotGseaTable(Hs.c5[x], Q, fgseaRes, gseaParam = 0.6, colwidths = c(7, 1.2, 0.8, 1, 1))
+
+dev.off()
+```
+
+
+
+
+```{r}
+library(fgsea)
+library(BiocParallel)
+library(limma)
+setwd(paste0(wd, "/dt"))
+load("human_c6_v5p2.rdata")
+
+fgseaRes <- fgsea(pathways = Hs.c6, 
+                  stats = Q,
+                  minSize=5,
+                  maxSize=10000,
+                  nperm=100000)
+idx <- ids2indices(Hs.c6,id=names(Q))
+
+C6 = as.data.frame(fgseaRes)
+
+C6 = C6[C6$padj<0.01,]
+C6 = C6[order(abs(C6$NES),decreasing = T),]
+x=rbind(C6[(C6$NES<0),][1:10,],C6[(C6$NES>0),][1:10,])
+x=x[order(x$NES,decreasing = T),]
+x=as.character(x$pathway)
+x=x[!is.na(x)]
+
+setwd(paste0(wd, "/res"))
+png(file="C6.png",width=300,height=(10+10*length(x)),res=400,units = "mm")
+
+plotGseaTable(Hs.c6[x], Q, fgseaRes, gseaParam = 0.6, colwidths = c(7, 1.2, 0.8, 1, 1))
+
+dev.off()
+```
+
+```{r}
+library(fgsea)
+library(BiocParallel)
+library(limma)
+setwd(paste0(wd, "/dt"))
+load("human_c7_v5p2.rdata")
+
+fgseaRes <- fgsea(pathways = Hs.c7, 
+                  stats = Q,
+                  minSize=5,
+                  maxSize=10000,
+                  nperm=100000)
+idx <- ids2indices(Hs.c7,id=names(Q))
+
+C7 = as.data.frame(fgseaRes)
+
+C7 = C7[C7$padj<0.01,]
+C7 = C7[order(abs(C7$NES),decreasing = T),]
+x=rbind(C7[(C7$NES<0),][1:10,],C7[(C7$NES>0),][1:10,])
+x=x[order(x$NES,decreasing = T),]
+x=as.character(x$pathway)
+x=x[!is.na(x)]
+
+setwd(paste0(wd, "/res"))
+png(file="C7.png",width=300,height=(10+10*length(x)),res=400,units = "mm")
+
+plotGseaTable(Hs.c7[x], Q, fgseaRes, gseaParam = 0.6, colwidths = c(7, 1.2, 0.8, 1, 1))
+
+dev.off()
+```
+
+
+
+```{r}
+library(fgsea)
+library(BiocParallel)
+library(limma)
+setwd(paste0(wd, "/dt"))
+load("human_c2_v5p2.rdata")
+
+Hs.c2 = Hs.c2[!grepl("KEGG", names(Hs.c2))]
+Hs.c2 = Hs.c2[!grepl("REACTOME", names(Hs.c2))]
+
+fgseaRes <- fgsea(pathways = Hs.c2, 
+                  stats = Q,
+                  minSize=5,
+                  maxSize=10000,
+                  nperm=100000)
+idx <- ids2indices(Hs.c2,id=names(Q))
+
+C2 = as.data.frame(fgseaRes)
+
+C2 = C2[C2$padj<0.01,]
+C2 = C2[order(abs(C2$NES),decreasing = T),]
+x=rbind(C2[(C2$NES<0),][1:10,],C2[(C2$NES>0),][1:10,])
+x=x[order(x$NES,decreasing = T),]
+x=as.character(x$pathway)
+x=x[!is.na(x)]
+
+setwd(paste0(wd, "/res"))
+png(file="C2.png",width=300,height=(10+10*length(x)),res=400,units = "mm")
+
+plotGseaTable(Hs.c2[x], Q, fgseaRes, gseaParam = 0.6, colwidths = c(7, 1.2, 0.8, 1, 1))
+
+dev.off()
+```
+
+
+
+```{r}
+library(fgsea)
+library(BiocParallel)
+library(limma)
+setwd(paste0(wd, "/dt"))
+load("human_c3_v5p2.rdata")
+
+fgseaRes <- fgsea(pathways = Hs.c3, 
+                  stats = Q,
+                  minSize=5,
+                  maxSize=10000,
+                  nperm=100000)
+idx <- ids2indices(Hs.c3,id=names(Q))
+
+C3 = as.data.frame(fgseaRes)
+
+C3 = C3[C3$padj<0.01,]
+C3 = C3[order(abs(C3$NES),decreasing = T),]
+x=rbind(C3[(C3$NES<0),][1:10,],C3[(C3$NES>0),][1:10,])
+x=x[order(x$NES,decreasing = T),]
+x=as.character(x$pathway)
+x=x[!is.na(x)]
+
+setwd(paste0(wd, "/res"))
+png(file="C3.png",width=300,height=(10+10*length(x)),res=400,units = "mm")
+
+plotGseaTable(Hs.c3[x], Q, fgseaRes, gseaParam = 0.6, colwidths = c(7, 1.2, 0.8, 1, 1))
+
+dev.off()
+```
+
+
+
+```{r}
+library(fgsea)
+library(BiocParallel)
+library(limma)
+setwd(paste0(wd, "/dt"))
+load("human_H_v5p2.rdata")
+
+fgseaRes <- fgsea(pathways = Hs.H, 
+                  stats = Q,
+                  minSize=5,
+                  maxSize=10000,
+                  nperm=100000)
+idx <- ids2indices(Hs.H,id=names(Q))
+
+Hallmark = as.data.frame(fgseaRes)
+
+Hallmark = Hallmark[Hallmark$padj<0.01,]
+Hallmark = Hallmark[order(abs(Hallmark$NES),decreasing = T),]
+x=rbind(Hallmark[(Hallmark$NES<0),][1:10,],Hallmark[(Hallmark$NES>0),][1:10,])
+x=x[order(x$NES,decreasing = T),]
+x=as.character(x$pathway)
+x=x[!is.na(x)]
+
+setwd(paste0(wd, "/res"))
+png(file="Hallmark.png",width=300,height=(10+10*length(x)),res=400,units = "mm")
+
+plotGseaTable(Hs.H[x], Q, fgseaRes, gseaParam = 0.6, colwidths = c(7, 1.2, 0.8, 1, 1))
+
+dev.off()
+```
+
+```{r}
+hvar = normalizeQuantiles(log2(case1_rpkm+2)-1)
+
+x = apply(hvar,1,var)
+
+x=x[!is.na(x)]
+
+x=x[x>(x[order(x,decreasing = T)][round(0.1*length(x))])]
+
+hvar = hvar[names(x),]
+
+f=function(x){
+  x[x==-Inf]=min(x[!x==-Inf])-1
+  x=x-median(x)
+  x=x/sd(x)
+}
+
+hvar = flip(apply(hvar,1,f))
+
+```
+
+
+```{r}
+d=dist(flip(hvar), method = "manhattan")
+h=hclust(d, method = "ward.D")
+ct=cutree(h,k=3)
+ct
+```
+
+```{r}
+ft$Cluster = as.character(ct[rownames(ft)])
+```
+
+```{r}
+H = flip(hvar)
+set.seed(2018)
+tsne = Rtsne(H, perplexity = 7)
+
+dr = tsne$Y
+rownames(dr)=rownames(H)
+colnames(dr)=c("X", "Y")
+
+dr=as.data.frame(dr)
+
+f = function(x){
+  C=NULL
+  C=paste(ifelse(x[1]==1, names(x)[1], ""), ifelse(x[2]==1, names(x)[2], ""), ifelse(x[3]==1, names(x)[3], ""), sep=" ")
+  return(C)
+}
+dr$fusion = apply(as.matrix(ft), 1, f)[rownames(dr)]
+
+
+
+
+setwd(paste0(wd, "/res"))
+png(file=paste("exTSNE", ".png", sep = ""),width=300,height=150,units = "mm",res=200)
+ggplot(dr, aes(x=X, y=Y, col=fusion)) + #create the 'base layer' of the plot
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right") +
+  scale_colour_manual(values=c("#000000","#0000ff","#00ff00", "#ff0000", "#ffffff")) +
+  geom_point(size=5) + #represent the data with points
+  ggtitle("TSNE")
+dev.off()
+
+dr=dr[,!colnames(dr)=="fusion"]
+dr$cluster = as.character(ct[rownames(dr)])
+
+setwd(paste0(wd, "/res"))
+png(file=paste("clusTSNE", ".png", sep = ""),width=300,height=150,units = "mm",res=200)
+ggplot(dr, aes(x=X, y=Y, col=cluster)) + #create the 'base layer' of the plot
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right") +
+  scale_colour_manual(values=c("orange","blue","green")) +
+  geom_point(size=5) + #represent the data with points
+  ggtitle("TSNE")
+dev.off()
+
+f = function(x){
+  C=NULL
+  C=paste(ifelse(x[1]==1, names(x)[1], ""), ifelse(x[2]==1, names(x)[2], ""), ifelse(x[3]==1, names(x)[3], ""), sep=" ")
+  return(C)
+}
+dr = prcomp(H)
+dr = as.data.frame(dr$x)
+dr$fusion = apply(as.matrix(ft), 1, f)[rownames(dr)]
+
+setwd(paste0(wd, "/res"))
+png(file=paste("exPCA", ".png", sep = ""),width=300,height=150,units = "mm",res=200)
+ggplot(dr, aes(x=PC1, y=PC2, col=fusion)) + #create the 'base layer' of the plot
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right") +
+  scale_colour_manual(values=c("#000000","#0000ff","#00ff00", "#ff0000", "#ffffff")) +
+  geom_point(size=5) + #represent the data with points
+  labs(x=paste("PC1 explains", as.character(signif(100*var(dr[,"PC1"])/sum(apply(dr[,!colnames(dr)=="fusion"],2,var)),digits=4)), "% of variance"),
+       y=paste("PC2 explains", as.character(signif(100*var(dr[,"PC2"])/sum(apply(dr[,!colnames(dr)=="fusion"],2,var)),digits=4)), "% of variance")) +
+  ggtitle("PCA")
+dev.off()
+
+dr=dr[,!colnames(dr)=="fusion"]
+dr$cluster = as.character(ct[rownames(dr)])
+
+setwd(paste0(wd, "/res"))
+png(file=paste("clusPCA", ".png", sep = ""),width=300,height=150,units = "mm",res=200)
+ggplot(dr, aes(x=PC1, y=PC2, col=cluster)) + #create the 'base layer' of the plot
+  theme(panel.border = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "right") +
+  scale_colour_manual(values=c("orange","blue","green")) +
+  geom_point(size=5) + #represent the data with points
+  labs(x=paste("PC1 explains", as.character(signif(100*var(dr[,"PC1"])/sum(apply(dr[,!colnames(dr)=="fusion"],2,var)),digits=4)), "% of variance"),
+       y=paste("PC2 explains", as.character(signif(100*var(dr[,"PC2"])/sum(apply(dr[,!colnames(dr)=="fusion"],2,var)),digits=4)), "% of variance")) +
+  ggtitle("PCA")
+dev.off()
+```
+
+```{r}
+hch(flip(hvar))
+```
+
+```{r}
+col = list(`MTATP8P2--MTATP6P1` = c("1" = "black", "0" = "white"),
+           `MTND2P28--MTND2P5` = c("1" = "black", "0" = "white"),
+           `C1QC--CACNB3` = c("1" = "black", "0" = "white"),
+           `Fusion load` = colorRamp2(c(1,max(ft$`Fusion load`)),c("white","purple")),
+           Cluster = c("1" = "orange", "2" = "blue", "3"= "green"))
+
+ha <- HeatmapAnnotation(ft[colnames(hvar),], col = col)
+
+setwd(paste0(wd, "/res"))
+png(file="exprs.png",width=1000,height=800)
+Heatmap(hvar,
+        top_annotation = ha,
+        #col = colorRamp2(c(min(degs), 0, (-0.7)*(min(degs)), (-1.4)*(min(degs)),(-2.1)*(min(degs)), max(degs)), c("blue", "white", "yellow", "orange", "red", "red4")),
+        clustering_method_columns = "ward.D",
+        clustering_distance_columns = "manhattan",
+        show_row_dend = F,
+        show_row_names = F)
+dev.off()
+```
+
+```{r}
+hch(flip(xcell))
+```
+
+```{r}
+hch(xcell)
+```
+
+```{r}
+ha <- HeatmapAnnotation(ft[colnames(xcell),], col = col)
+
+x = median(as.matrix(xcell)[!as.matrix(xcell)==0])
+
+setwd(paste0(wd, "/res"))
+png(file="xCell.png",width=1000,height=800)
+Heatmap(xcell[!rownames(xcell)=="Other",],
+        col = colorRamp2(c(0, x/2, x, max(as.matrix(xcell[!rownames(xcell)=="Other",]))),
+                         c("white","yellow","red","darkblue")),
+        top_annotation = ha,
+        clustering_method_columns = "mcquitty",
+        clustering_distance_columns = "canberra",
+        clustering_method_rows = "ward.D",
+        clustering_distance_rows = "manhattan")
+```
+
+
+
+```{r}
+hch(flip(xsort))
+```
+
+```{r}
+hch(xsort)
+```
+
+```{r}
+ha <- HeatmapAnnotation(ft[colnames(xsort),], col = col)
+
+x = median(as.matrix(xsort)[!as.matrix(xsort)==0])
+
+setwd(paste0(wd, "/res"))
+png(file="Cibersort.png",width=1000,height=800)
+Heatmap(xsort,
+        col = colorRamp2(c(0, x/2, x, max(as.matrix(xsort))),
+                         c("white","yellow","red","darkblue")),
+        top_annotation = ha,
+        clustering_method_columns = "ward.D2",
+        clustering_distance_columns = "euclidean",
+        clustering_method_rows = "complete",
+        clustering_distance_rows = "maximum")
+```
+
+```{r}
+counts=as.data.frame(xtabs(~Cluster + `MTATP8P2--MTATP6P1`, data = ft))
+table = xtabs(Freq ~ Cluster + `MTATP8P2..MTATP6P1`, data=counts)
+table
+fisher.test(table)
+
+counts=as.data.frame(xtabs(~Cluster + `MTND2P28--MTND2P5`, data = ft))
+table = xtabs(Freq ~ Cluster + `MTND2P28..MTND2P5`, data=counts)
+table
+fisher.test(table)
+
+counts=as.data.frame(xtabs(~Cluster + `C1QC--CACNB3`, data = ft))
+table = xtabs(Freq ~ Cluster + `C1QC..CACNB3`, data=counts)
+table
+fisher.test(table)
+```
+
+
+
+
+
+
+```{r}
+kruskal = function(M,resp){
+  X = data.frame(names=rownames(M),p=1,Z=0,g=" ")
+  X$g = as.character(X$g)
+  rownames(X)=X$names
+  for(el in rownames(M)){
+    df = data.frame(pop = as.matrix(M)[el,],
+                    clust = as.factor(resp))
+    x = kruskal.test(pop ~ clust, data = df)
+    X[el,"p"] = x$p.value
+    z=NULL
+  for(EL in 1:length(unique(resp))){
+    z = c(z, median(as.matrix(M)[el,resp==as.character(unique(resp)[EL])]))
+  }
+    if(median(as.matrix(M)[el,])>0){
+      z=z/(median(as.matrix(M)[el,]))
+      names(z)=as.character(unique(resp))
+      X[el,"Z"] = (max(z)-min(z))
+      X[el,"g"] = names(z)[z==max(z)]
+    } else {
+      X[el,"Z"] = 0
+      X[el,"g"] = "0"
+    }
+  }
+  X$padj = p.adjust(X$p, method = "BH")
+  X[order(X$p),!colnames(X)=="names"]
+  return(X[order(X$p),!colnames(X)=="names"])
+}
+```
+
+```{r}
+setwd(paste0(wd, "/res"))
+for(el in c("MTATP8P2--MTATP6P1","MTND2P28--MTND2P5","C1QC--CACNB3")){
+  x = wilcoxon(xcell,ft[colnames(xcell),el])
+  assign(paste(gsub("--", "_", el), "WT", "xcell", sep="_"), x)
+  x = x[x$padj<0.01,]
+  write.csv(x, file = paste(gsub("--", "_", el), "_WT", "_xCell", ".csv", sep=""))
+}
+```
+
+```{r}
+setwd(paste0(wd, "/res"))
+x = kruskal(xcell,ft[colnames(xcell),"Cluster"])
+Cluster_xcell = x
+x = x[x$padj<0.05,]
+write.csv(x, file = "xCell_cluster.csv")
+x = kruskal(xsort,ft[colnames(xsort),"Cluster"])
+Cluster_xsrt = x
+x = x[x$padj<0.05,]
+write.csv(x, file = "Cibersort_cluster.csv")
+```
+
+```{r}
+kruskal(xsort,ft[colnames(xsort),"Cluster"])
+```
+
+```{r}
+'
+setwd(paste0(wd, "/res"))
+#load("clv.Rdata")
+
+
+clv = clValid(obj = exprs,
+              clMethods = c("hierarchical", "kmeans", "clara", "diana", "sota", "pam", "agnes"), #"model", "fanny", 
+              #annotation = Hs.c5, 
+              validation = c("internal"), #,"biological", "stability"
+              metric = "manhattan",
+              method = "ward",
+              nClust = 2:5,
+              verbose = T)
+optimalScores(clv)
+setwd(paste0(wd, "/res"))
+save(clv, file = "clv.Rdata")
+'
+```
+
+
+
+
+```{r}
+setwd(paste0(wd, "/res"))
+load("clv.Rdata")
+
+'
+clv = clValid(obj = exprs,
+              clMethods = c("hierarchical"), #"model", "fanny", "kmeans", "clara", "diana", "sota", "pam", "agnes"
+              #annotation = Hs.c5, 
+              validation = c("internal"), #,"biological", "stability"
+              metric = "euclidean",
+              method = "ward",
+              nClust = 3,
+              verbose = T)
+optimalScores(clv)
+setwd(paste0(wd, "/res"))
+save(clv, file = "clv.Rdata")
+
+optimalScores(clv)
+
+plot(clv)
+'
+```
+
+
+
+```{r}
+H=flip(hvar)
+
+```
+
+
+
+```{r}
+rbind(t,
+                matrix(nrow=1, c(X,x,el,connectivity(d,ct),dunn(d,ct),mean(silhouette(x=ct, dist=d)[,3]))))
+```
+
+
+
+
+
+
+
+
+
+```{r}
+X=flip(degs)
+ft$clust = ct[rownames(ft)]
+
+col = list(`MTATP8P2--MTATP6P1` = c("1" = "black", "0" = "white"),
+           `MTND2P28--MTND2P5` = c("1" = "black", "0" = "white"),
+           `C1QC--CACNB3` = c("1" = "black", "0" = "white"),
+           clust = c("1" = "red", "2" = "blue", "3"= "yellow", "4"= "black"))
+
+ha <- HeatmapAnnotation(ft[colnames(X),], col = col)
+
+setwd(paste0(wd, "/res"))
+png(file=paste("exprs", ".png", sep = ""),width=1000,height=800)
+Heatmap(X,
+        top_annotation = ha,
+        col = colorRamp2(c(min(degs), 0, (-0.7)*(min(degs)), (-1.4)*(min(degs)),(-2.1)*(min(degs)), max(degs)), c("blue", "white", "yellow", "orange", "red", "red4")),
+        clustering_method_columns = "complete",
+        show_row_dend = F,
+        show_row_names = F,
+        clustering_distance_columns = "canberra")
+dev.off()
+```
+
+```{r}
+rownames(degs)
+```
+
+
+
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
